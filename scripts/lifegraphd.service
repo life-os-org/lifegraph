@@ -1,0 +1,22 @@
+[Unit]
+Description=Life graph daemon (holds the unlocked key in memory, only while you've unlocked it)
+
+[Service]
+Type=simple
+ExecStart=%h/projects/lifegraph/.venv/bin/lifegraphd
+Restart=on-failure
+RestartSec=2
+# nothing is written outside ~/.local/share/lifegraph and the per-user runtime dir
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=%h/.local/share/lifegraph
+RuntimeDirectory=lifegraph
+RuntimeDirectoryMode=0700
+ProtectHome=read-only
+MemoryDenyWriteExecute=no
+# keep the key out of swap and core dumps
+LimitCORE=0
+
+[Install]
+WantedBy=default.target

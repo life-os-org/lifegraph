@@ -46,6 +46,8 @@ and a bare name that matches several kinds of entity is refused rather than gues
 | **Agents propose; the graph answers with exactly what will happen.** Edits, deletes and merges wait for your yes (a graph diff in `life review`); everything applied is undoable for 7 days. | A confident but wrong delete or edit |
 | **Approving, granting and `forget` re-ask for the passphrase.** | An agent with a shell approving its own change |
 | **The graph is open while you're logged in** (keys in the OS keyring, forgotten by `life lock`; `--hours` unlocks are temporary and never kept). The sealed mailbox is only the fallback while it is locked. | A stolen disk or backup (still ciphertext) |
+| **Auto-capture can only propose additions**, scrubs obvious secrets from the transcript first, never captures its own headless run, and is off until `life capture on`. | A noisy or wrong extraction changing your graph; secrets leaking into it |
+| **Meaning search is local** (fastembed/ollama/lite); vectors live inside the encrypted database. | Sending your graph to an embedding service |
 | **Audit log** records every write source and every read. | Quiet misuse; you can check |
 | **systemd sandbox** on the daemon: read-only home except its data dir, no new privileges, no core dumps. | The daemon being used as a stepping stone |
 

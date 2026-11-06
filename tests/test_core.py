@@ -197,3 +197,43 @@ def test_agent_grants_carry_a_level(env):
     assert s.grant_info(t) == {"name": "cleaner", "level": "manage", "ask_adds": False, "auto_destructive": True}
     s.revoke("cleaner"); assert s.grant_info(t) is None
     with pytest.raises(ValueError): s.grant("x", level="root")
+
+def test_meaning_search_and_hybrid(env, monkeypatch):
+    monkeypatch.setenv("LIFEGRAPH_EMBED", "lite")
+    from lifegraph import embed
+    s = _fresh(env); emb, _ = embed.get()
+    s.log_event("Debugged the scheduler deadlock", when="2026-10-01", body="mutex ordering bug in the kernel", entities=["project:Kernel"])
+    s.log_event("Went climbing", when="2026-10-02", entities=["person:Sam"]); s.remember("person:Sam", "prefers vegetarian food")
+    assert s.index_status()["waiting"] >= 3 and s.embed_pending(emb) >= 3 and s.index_status()["waiting"] == 0
+    hits = s.hybrid_search(emb, "schedulr deadlok")                               # typos: keyword search finds nothing, lite vectors do
+    assert s.search("schedulr deadlok") == [] and hits[0]["name"] == "Debugged the scheduler deadlock" and hits[0]["found_by"] == "meaning"
+    assert s.hybrid_search(emb, "climbing")[0]["found_by"] in ("both", "keyword")
+    s.remember("person:Sam", "is allergic to peanuts"); assert s.index_status()["waiting"] == 1                     # edits re-queue
+    ref = s.entity("Sam")["facts"][0]["ref"]; changes.submit(s, [{"op": "forget", "ref": ref}], {"name": "o", "level": "manage", "ask_adds": False, "auto_destructive": True})
+    s.embed_pending(emb); assert not any("peanuts" in str(h) for h in s.hybrid_search(emb, "peanuts allergy", 5) if h["found_by"] != "meaning" and "peanuts" in h.get("snippet", ""))
+    s.reindex("other-model"); assert s.index_status()["indexed"] == 0 and s.index_status()["waiting"] > 0         # new backend: everything re-embedded
+
+def test_ids_are_never_reused_and_old_stores_restore_under_a_new_id(env):
+    s = _fresh(env); M2 = {"name": "o", "level": "manage", "ask_adds": False, "auto_destructive": True}
+    changes.submit(s, [{"op": "fact", "subject": "person:Sam", "text": "a"}, {"op": "fact", "subject": "person:Sam", "text": "b"}], M2)
+    b = s.entity("Sam")["facts"][0]["ref"]; d = changes.submit(s, [{"op": "forget", "ref": b}], M2)
+    changes.submit(s, [{"op": "fact", "subject": "person:Sam", "text": "c"}], M2)
+    assert b not in [f["ref"] for f in s.entity("Sam")["facts"]]                  # the deleted ref is not handed to something new
+    assert changes.undo(s, d["changeset"], M2)["status"] == "undone" and sorted(f["text"] for f in s.entity("Sam")["facts"]) == ["a", "b", "c"]
+    # a store from before AUTOINCREMENT can reuse ids: undo then restores under a fresh id instead of colliding
+    snap = {"kind": "f", "id": s.entity("Sam")["facts"][0]["ref"][2:] and int(s.entity("Sam")["facts"][0]["ref"][2:]), "row": [s.resolve("person:Sam"), "dup", 1.0, "t", None], "label": "x"}
+    sk, moved = s.restore_snapshot(snap); assert moved and "→" in moved
+
+def test_paths_become_files_and_folders_tied_to_the_work(env, monkeypatch):
+    monkeypatch.setenv("HOME", "/home/someone")
+    s = _fresh(env)
+    r = changes.submit(s, [{"op": "event", "title": "Rewrote the scheduler", "when": "2026-10-01", "projects": ["Kernel"],
+                            "paths": ["/home/someone/projects/kernel/", "/home/someone/projects/kernel/sched.c", "~/projects/kernel/sched.c", {"path": "Makefile", "kind": "file"}]}], W)
+    assert r["status"] == "applied" and any("located_at" in x for x in r["summary"])                          # one project + one folder: linked automatically
+    k = s.entity("project:Kernel"); assert [x["with"] for x in k["relations"]] == ["directory:~/projects/kernel"]
+    ev = s.get(s.entity("project:Kernel")["events"][0]["ref"]); names = {w["entity"] for w in ev["with"]}
+    assert {"directory:~/projects/kernel", "file:~/projects/kernel/sched.c", "file:Makefile"} <= names      # ~ names are stable, duplicates collapse
+    assert s.entity("file:~/projects/kernel/sched.c")["events"][0]["title"] == "Rewrote the scheduler"      # "what did I do to this file?"
+    assert not any(n["kind"] == "file" for n in s.graph_view()["nodes"])                                       # files stay out of the picture, but searchable
+    assert s.search("sched.c")
+    assert len(changes.path_entities({"paths": [f"/a/{i}" for i in range(40)]})) == changes.MAX_PATHS

@@ -17,7 +17,7 @@ import time
 
 from mcp.server.mcpserver import MCPServer
 
-from . import crypto, inbox, ipc
+from . import commands, crypto, inbox, ipc
 
 INSTRUCTIONS = """\
 This is the user's private, encrypted life graph: what they did, who was involved, what they decided and learned, and how
@@ -35,6 +35,9 @@ How to use it
   "denied": you are not allowed to do that; tell the user what level they would need to grant.
 - To delete or correct something, find its ref with search/get, then propose a forget or edit_fact op on that exact ref.
   Prefer the narrowest ref (one fact or link, not a whole person). A misspelled duplicate is a merge, not a delete.
+- Say where work lives: on events and notes about code or files, pass `paths` (the project folder ending in "/", plus the few files
+  that mattered) and link the project to its folder with rel "located_at". Only paths you actually saw or used. Later, get("project:X")
+  tells you where it lives.
 - Show the user what you are about to change in a sentence or two when it is destructive.
 """
 
@@ -81,7 +84,8 @@ def build() -> MCPServer:
     def propose(ops: list[dict], dry_run: bool = False) -> dict:
         """Change the graph. `ops` is a list (max 50) applied together, all or nothing. Each op is an object with an "op" key:
           {"op":"event", "title":"Finished the OS lab", "when":"2026-10-14T17:30", "body":"...", "kind":"event|decision|milestone|learning|meeting",
-             "people":["Sam"], "places":[], "projects":["OSLab"], "topics":["Algorithms"], "entities":[{"kind":"org","name":"Acme University","role":"at"}]}
+             "people":["Sam"], "places":[], "projects":["OSLab"], "topics":["Algorithms"], "entities":[{"kind":"org","name":"Acme University","role":"at"}],
+             "paths":["~/projects/oslab/", "~/projects/oslab/sched.c"]}      (paths: where the work lives; folders end with "/", home is ~)
           {"op":"note", "text":"...", "title":"...", "when":"...", "people":[], "projects":[], "topics":[]}
           {"op":"fact", "subject":"person:Sam", "text":"is in my Algorithms class", "when":"..."}
           {"op":"link", "src":"project:OSLab", "rel":"part_of", "dst":"course:Algorithms", "start":"...", "end":"..."}
@@ -101,6 +105,10 @@ def build() -> MCPServer:
         """Reverse a change you applied (c:N from propose), including restoring what it deleted, or withdraw one still awaiting approval.
         Possible for 7 days. Merges can't be undone."""
         return ask("undo", changeset=changeset)
+
+    @mcp.prompt(name="lifegraph", description="Save what's worth remembering from this conversation to the user's life graph")
+    def lifegraph(focus: str = "") -> str:
+        return commands.text(focus)
 
     return mcp
 

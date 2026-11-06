@@ -1,5 +1,8 @@
 # Before this can be taken to product
 
+Also built since: `/lifegraph` (MCP prompt + command files), toggleable Claude Code auto-capture (propose-only, secret scrubbing, pluggable LLM
+backend), local semantic search (fastembed / ollama / lite), and the Explore tab (search, open, fix, merge, delete with undo).
+
 Done in the streamlining pass: changesets (`propose`/`undo`) with per-name "existing or new" resolution, graph-diff review page,
 three permission levels per agent, undo for 7 days, graph kept open via the OS keyring, four MCP tools instead of eight.
 
@@ -31,3 +34,17 @@ three permission levels per agent, undo for 7 days, graph kept open via the OS k
 16. **Performance.** `graph_view` caps at 400 nodes with full scans; test at 50k events. Preview computation re-runs the ops in a transaction, fine at 50 ops, test large merges.
 17. **Tests still missing:** concurrent proposals, drain racing an approve, locked-daemon undo, a pending change whose targets were since deleted (approve returns `invalid`; covered only by hand), macOS/Windows paths.
 18. **Docs.** User-facing privacy statement (what is kept, how long, where) and onboarding that explains the three levels.
+
+## Added with capture / semantic search / explorer
+19. **Capture only covers Claude Code.** Codex and opencode rely on `/lifegraph`; add hooks/adapters if they expose session-end events. Capture quality has only been checked by hand on a few sessions, so build an eval set before trusting it.
+20. **Capture sends transcripts to the chosen LLM.** The default backend sends them to Anthropic via the user's CLI; the UI needs a clear one-time consent screen and a per-project opt-out (today: `LIFEGRAPH_NO_CAPTURE=1`).
+21. **Capture dedupe.** Re-running on the same session (or two sessions covering the same work) can propose near-duplicates; add a session-id ledger and similarity check against existing events.
+22. **Semantic search model download.** fastembed downloads ~130 MB on first use (from Hugging Face); ship the model offline or pin a checksum. Vectors are brute-force cosine in memory: fine to ~100k items, then needs an ANN index.
+23. **Explorer is a local page behind a passphrase prompt in the terminal**, with a force-directed layout that gets crowded past ~150 nodes (labels thin out). Needs real graph navigation (filters, neighbourhood expansion) and a desktop-app shell.
+24. **Ids on old stores can be reused after a delete.** New stores use AUTOINCREMENT; older databases restore under a new ref when the old one was taken (reported as `new_refs`). Migrate old tables on a schema bump.
+25. **Paths are stored in the graph** (folders and files that events touched, home shown as `~`). Decide what to do about paths outside the home folder or in private repos, add a per-project "don't record paths" switch, and handle moved/renamed folders (a `located_at` link goes stale).
+26. **Native window is Linux-tested only.** Built and run on Wayland + AMD Vulkan. Needs checks on X11, NVIDIA/Intel, macOS (Metal) and Windows, plus a software-rendering fallback for machines without a usable GPU.
+27. **Berkeley Mono is commercial.** It is embedded only from the owner's local copy at build time (never committed). A shipped binary would need Berkeley's redistribution terms or an open font instead.
+28. **Labels lag the GPU by a few frames while the layout is still moving** (positions are read back asynchronously). Fine once settled; the proper fix is drawing labels with GPU text or reading positions back synchronously for the visible set.
+29. **Window UX gaps:** no keyboard navigation or screen-reader support, no multi-select, no saved layouts/filters, the layout is O(n^2) per step on the GPU (fine to a few thousand nodes, then needs Barnes-Hut or a grid), and `life ui` still asks for the passphrase in the terminal before the window opens.
+30. **Brand.** The logo is a first pass (Liberation Sans wordmark, SVGs only; the generator script was not kept). Needs a trademark/name check, a proper typeface decision (Liberation is a stand-in), small-size and favicon variants, and usage rules.

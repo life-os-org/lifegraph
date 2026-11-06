@@ -16,15 +16,15 @@ import socketserver
 import threading
 import time
 
-from . import changes, crypto, ipc, keystore
+from . import changes, crypto, embed, ipc, keystore
 from .inbox import append_sealed, inbox_path, pending  # noqa: F401  (re-exported: mcp_server and cli use daemon.append_sealed)
 from .store import Store
 
 PROTOCOL = 1            # bump on any incompatible change to the socket messages; see docs/PROTOCOL.md
 DEFAULT_HOURS = 2.0
 READ_OPS = {"search", "entity", "related", "timeline", "stats", "graph"}
-ADMIN_OPS = READ_OPS | {"audit", "grants", "export", "merge_preview", "changes", "change"}
-AGENT_OPS = {"search", "get", "propose", "undo"}
+ADMIN_OPS = READ_OPS | {"audit", "grants", "export", "merge_preview", "changes", "change", "get"}
+AGENT_OPS = {"search", "get", "propose", "undo", "names"}
 
 
 class State:
@@ -102,6 +102,35 @@ class State:
 
 
 S = State()
+EMBED = {"backend": None, "note": "", "ready": False}
+
+
+def embedder_loop():
+    """Keeps meaning-search vectors current in the background. Loading the model (a one-off download for fastembed) never blocks requests."""
+    while True:
+        time.sleep(1)
+        try:
+            st = S.store
+            if not (S.unlocked and st):
+                continue
+            emb, note = embed.get()
+            if emb.name != EMBED["backend"] or not EMBED["ready"]:
+                st.reindex(emb.name)       # a changed backend re-embeds everything under the new model
+                EMBED.update(backend=emb.name, note=note, ready=True)
+            while S.unlocked and st is S.store and st.embed_pending(emb):
+                pass
+        except Exception as e:   # noqa: BLE001
+            EMBED["note"] = f"indexing paused: {type(e).__name__}: {str(e)[:80]}"
+            time.sleep(10)
+
+
+def run_search(q: str, limit: int) -> list[dict]:
+    if EMBED["ready"]:
+        try:
+            return S.store.hybrid_search(embed.get()[0], q, limit)
+        except Exception:   # noqa: BLE001
+            pass
+    return S.store.search(q, limit)
 
 
 def authorized(msg: dict, admin_ok: bool) -> str | None:
@@ -154,7 +183,7 @@ def handle(msg: dict) -> dict:
             S.store.audit(who, f"read:{op}", json.dumps(a)[:100])
             S.store.con.commit()
             if op == "search":
-                data = S.store.search(a["query"], int(a.get("limit", 10)))
+                data = run_search(a["query"], int(a.get("limit", 10)))
             elif op == "entity":
                 data = S.store.entity(a["name"], int(a.get("events", 10)))
             elif op == "related":
@@ -164,11 +193,13 @@ def handle(msg: dict) -> dict:
             elif op == "graph":
                 data = S.store.graph_view()
             elif op == "stats":
-                data = S.store.stats()
+                data = {**S.store.stats(), "search_index": {**S.store.index_status(), "backend": EMBED["backend"], "note": EMBED["note"]}}
             elif op == "merge_preview":
                 data = S.store.merge(a["from"], a["to"], "cli", dry_run=True)
             elif op == "audit":
                 data = S.store.audit_log(int(a.get("limit", 30)))
+            elif op == "get":
+                data = S.store.get(a["ref"], int(a.get("depth", 0)))
             elif op == "changes":
                 data = changes.listing(S.store, a.get("status"), int(a.get("limit", 30)), full=True)
             elif op == "change":
@@ -193,6 +224,12 @@ def handle(msg: dict) -> dict:
                 return {"ok": True, "data": S.store.merge(a["from"], a["to"], "cli")}
             if op == "forget":
                 return {"ok": True, "data": {"forgotten": S.store.forget(a["ref"], "cli")}}
+            if op == "reindex":
+                with S.store.lock:
+                    S.store.con.execute("DELETE FROM vectors"); S.store._vmat = None
+                return {"ok": True, "data": {"queued": S.store.reindex()}}
+            if op == "apply":
+                return {"ok": True, "data": changes.submit(S.store, a["ops"], changes.OWNER, "owner-ui", dry_run=bool(a.get("dry_run")))}
             if op == "approve":
                 return {"ok": True, "data": changes.approve(S.store, a["id"])}
             if op == "reject":
@@ -220,7 +257,9 @@ def handle_agent(msg: dict) -> dict:
         if op == "search":
             q = (a.get("query") or "").strip()
             lim = max(1, min(int(a.get("limit", 10)), 50))
-            data = S.store.search(q, lim) if q else S.store.timeline(a.get("since"), a.get("until"), a.get("about"), None, lim)
+            data = run_search(q, lim) if q else S.store.timeline(a.get("since"), a.get("until"), a.get("about"), None, lim)
+        elif op == "names":
+            data = S.store.names(max(1, min(int(a.get("limit", 80)), 200)))
         elif op == "get":
             ref = str(a["ref"]).strip()
             data = changes.show(S.store, ref, g) if ref.startswith("c:") else S.store.get(ref, int(a.get("depth", 0)))
@@ -279,6 +318,7 @@ def serve():
         except Exception:   # noqa: BLE001  (stale keys after a passphrase/identity change)
             keystore.clear()
     threading.Thread(target=background, daemon=True).start()
+    threading.Thread(target=embedder_loop, daemon=True).start()
     print(f"lifegraphd listening on {path}", flush=True)
     try:
         srv.serve_forever()

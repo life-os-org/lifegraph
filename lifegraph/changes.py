@@ -16,7 +16,9 @@ Operations (dicts with an "op" key):
 from __future__ import annotations
 
 import json
+import os
 import time
+from pathlib import Path
 
 from .store import UNDO_DAYS, Store, iso
 
@@ -26,6 +28,7 @@ ALIASES = {"log_event": "event", "remember": "fact", "add_note": "note", "delete
 REQUIRED = {"event": ["title"], "note": ["text"], "fact": ["subject", "text"], "link": ["src", "rel", "dst"],
             "edit_fact": ["ref", "text"], "forget": ["ref"], "merge": ["from", "to"]}
 MAX_OPS = 50
+OWNER = {"name": "owner", "level": "manage", "ask_adds": False, "auto_destructive": True, "owner": True}
 
 
 # ---------------------------------------------------------------- input
@@ -61,6 +64,8 @@ def normalize(ops) -> tuple[list[dict], list[str]]:
 
 def decide(grant: dict, ops: list[dict]) -> tuple[str, str]:
     """('apply' | 'hold' | 'deny', why). The grant sets how much an agent may do on its own."""
+    if grant.get("owner"):       # the owner acting through their own UI: everything applies at once (and stays undoable)
+        return "apply", ""
     lvl = grant["level"]
     if lvl == "read":
         return "deny", "This agent is read-only. The owner can raise it with `life connect <agent> --level write` (add) or `--level manage` (also edit/delete)."
@@ -77,11 +82,41 @@ def decide(grant: dict, ops: list[dict]) -> tuple[str, str]:
     return "apply", ""
 
 
+MAX_PATHS = 12
+
+
+def norm_path(p) -> tuple[str, str] | None:
+    """('~/projects/x/file.py', 'file' | 'directory') for a path an agent gives. A trailing "/" (or {"path","kind"}) means directory.
+    The home folder is written as ~ so the same place always gets the same name."""
+    kind = None
+    if isinstance(p, dict):
+        kind, p = p.get("kind"), p.get("path") or p.get("name")
+    p = str(p or "").strip()
+    if not p:
+        return None
+    kind = kind if kind in ("file", "directory") else ("directory" if p.endswith(("/", os.sep)) else "file")
+    home = os.environ.get("HOME") or str(Path.home())
+    p = os.path.normpath(p.replace("~", home, 1) if p == "~" or p.startswith("~/") else p)
+    if p == home or p.startswith(home + "/"):
+        p = "~" + p[len(home):]
+    return p, kind
+
+
+def path_entities(op: dict) -> list[dict]:
+    out, seen = [], set()
+    for raw in (op.get("paths") or [])[:MAX_PATHS]:
+        n = norm_path(raw)
+        if n and n[0] not in seen:
+            seen.add(n[0])
+            out.append({"kind": n[1], "name": n[0], "role": "touches"})
+    return out
+
+
 def _lists(op: dict) -> list:
     out = []
     for key, kind in (("people", "person"), ("places", "place"), ("projects", "project"), ("topics", "topic")):
         out += [{"kind": kind, "name": n} for n in (op.get(key) or []) if str(n).strip()]
-    return out + list(op.get("entities") or [])
+    return out + path_entities(op) + list(op.get("entities") or [])
 
 
 def entity_refs(op: dict) -> list:
@@ -171,8 +206,14 @@ def execute(st: Store, ops: list[dict], source: str, ts: float) -> dict:
                     lines.append(f"Skip {what}: already in the graph")
                 else:
                     created_events.append(r["event_id"])
-                    with_ = ", ".join(r["entities"])
-                    lines.append(f"Add {what} on {r['when']}" + (f" involving {with_}" if with_ else ""))
+                    with_ = ", ".join(e for e in r["entities"] if e not in {p["name"] for p in path_entities(op)})
+                    paths = path_entities(op)
+                    lines.append(f"Add {what} on {r['when']}" + (f" involving {with_}" if with_ else "") + (f", tied to {len(paths)} path(s): " + ", ".join(p["name"] for p in paths[:4]) + (" …" if len(paths) > 4 else "") if paths else ""))
+                    dirs, projs = [p for p in paths if p["kind"] == "directory"], [e for e in _lists(op) if e.get("kind") == "project"]
+                    if len(dirs) == 1 and len(projs) == 1:      # one project, one folder: that is where the project lives
+                        lr = st.link(projs[0], "located_at", {"kind": "directory", "name": dirs[0]["name"]}, None, None, None, source)
+                        if not lr.get("duplicate"):
+                            lines.append(f"Link project:{projs[0]['name']} —located_at→ directory:{dirs[0]['name']}")
             elif k == "fact":
                 r = st.remember(op["subject"], op["text"], op.get("when"), source)
                 if r.get("duplicate"):
@@ -435,10 +476,13 @@ def undo(st: Store, ref, grant: dict | None = None, who: str = "owner") -> dict:
                 kept.append(f"e:{i}")
             else:
                 st.delete_snapshot(snap)
-        skipped = 0
+        skipped, moved = 0, []
         order = {"e": 0, "v": 1, "f": 2, "g": 3}
         for snap in sorted(eff["deleted"], key=lambda s: order[s["kind"]]):
-            skipped += st.restore_snapshot(snap)
+            sk, mv = st.restore_snapshot(snap)
+            skipped += sk
+            if mv:
+                moved.append(mv)
         st.con.execute("UPDATE changesets SET status='undone', decided_at=?, effects=NULL WHERE id=?", (time.time(), cid))
         st.audit(who, "undo", f"c:{cid}")
         st.con.commit()
@@ -447,6 +491,8 @@ def undo(st: Store, ref, grant: dict | None = None, who: str = "owner") -> dict:
         out["kept"] = f"{', '.join(kept)} still used by other things, so they stay"
     if skipped:
         out["links_skipped"] = skipped
+    if moved:
+        out["new_refs"] = moved
     return out
 
 

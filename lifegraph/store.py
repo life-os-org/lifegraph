@@ -15,13 +15,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import sqlcipher3
 
 from . import crypto
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS entities(
-  id INTEGER PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL, norm TEXT NOT NULL,
+  id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, name TEXT NOT NULL, norm TEXT NOT NULL,
   props TEXT NOT NULL DEFAULT '{}', created_at REAL, updated_at REAL, source TEXT,
   UNIQUE(kind, norm));
 CREATE TABLE IF NOT EXISTS aliases(
@@ -32,7 +33,7 @@ CREATE TABLE IF NOT EXISTS merged_names(
   kind TEXT NOT NULL, norm TEXT NOT NULL, entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
   PRIMARY KEY(kind, norm));
 CREATE TABLE IF NOT EXISTS events(
-  id INTEGER PRIMARY KEY, ts REAL NOT NULL, title TEXT NOT NULL, body TEXT, kind TEXT NOT NULL DEFAULT 'event',
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, title TEXT NOT NULL, body TEXT, kind TEXT NOT NULL DEFAULT 'event',
   props TEXT NOT NULL DEFAULT '{}', created_at REAL, source TEXT, dedupe TEXT UNIQUE);
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
 CREATE TABLE IF NOT EXISTS event_entities(
@@ -41,12 +42,12 @@ CREATE TABLE IF NOT EXISTS event_entities(
   PRIMARY KEY(event_id, entity_id, role));
 CREATE INDEX IF NOT EXISTS ee_entity ON event_entities(entity_id);
 CREATE TABLE IF NOT EXISTS edges(
-  id INTEGER PRIMARY KEY, src INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE, rel TEXT NOT NULL,
+  id INTEGER PRIMARY KEY AUTOINCREMENT, src INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE, rel TEXT NOT NULL,
   dst INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE, props TEXT NOT NULL DEFAULT '{}',
   start_ts REAL, end_ts REAL, created_at REAL, source TEXT);
 CREATE INDEX IF NOT EXISTS edges_src ON edges(src); CREATE INDEX IF NOT EXISTS edges_dst ON edges(dst);
 CREATE TABLE IF NOT EXISTS facts(
-  id INTEGER PRIMARY KEY, entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE, text TEXT NOT NULL,
+  id INTEGER PRIMARY KEY AUTOINCREMENT, entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE, text TEXT NOT NULL,
   ts REAL NOT NULL, source TEXT, superseded_by INTEGER);
 CREATE TABLE IF NOT EXISTS grants(
   name TEXT PRIMARY KEY, token_hash TEXT NOT NULL, created_at REAL, expires_at REAL, revoked INTEGER NOT NULL DEFAULT 0);
@@ -56,6 +57,8 @@ CREATE TABLE IF NOT EXISTS changesets(
 CREATE INDEX IF NOT EXISTS cs_status ON changesets(status);
 CREATE TABLE IF NOT EXISTS audit(
   id INTEGER PRIMARY KEY, ts REAL NOT NULL, source TEXT, action TEXT NOT NULL, ref TEXT);
+CREATE TABLE IF NOT EXISTS vectors(ref TEXT PRIMARY KEY, model TEXT NOT NULL, dim INTEGER NOT NULL, vec BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS vec_dirty(ref TEXT PRIMARY KEY);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(kind, name, body, ref UNINDEXED, tokenize='porter unicode61');
 """
 
@@ -100,6 +103,7 @@ class Store:
     def __init__(self, keys: crypto.Keys, path: Path | None = None):
         self.path = Path(path or crypto.home() / "graph.db")
         self.lock = threading.RLock()
+        self._vmat = None       # cached (refs, matrix) for meaning search; dropped whenever vectors change
         self._tx = 0            # >0 while a changeset is running: writes stay uncommitted so the whole thing can roll back
         self.con = sqlcipher3.connect(str(self.path), check_same_thread=False)
         self.con.execute(f"PRAGMA key=\"x'{keys.db_key_hex}'\"")
@@ -149,6 +153,14 @@ class Store:
     def _fts_set(self, ref: str, kind: str, name: str, body: str):
         self.con.execute("DELETE FROM fts WHERE ref=?", (ref,))
         self.con.execute("INSERT INTO fts(kind,name,body,ref) VALUES(?,?,?,?)", (kind, name, body or "", ref))
+        self.con.execute("INSERT OR IGNORE INTO vec_dirty(ref) VALUES(?)", (ref,))      # the embedding is refreshed in the background
+
+    def _drop_search(self, ref: str):
+        """Remove a thing from keyword AND meaning search."""
+        self.con.execute("DELETE FROM fts WHERE ref=?", (ref,))
+        self.con.execute("DELETE FROM vectors WHERE ref=?", (ref,))
+        self.con.execute("DELETE FROM vec_dirty WHERE ref=?", (ref,))
+        self._vmat = None
 
     def _entity_text(self, eid: int) -> str:
         e = self.con.execute("SELECT props FROM entities WHERE id=?", (eid,)).fetchone()
@@ -172,6 +184,11 @@ class Store:
         kind = None
         props = None
         aliases: list[str] = []
+        if not isinstance(ref, dict) and re.match(r"^e:\d+$", str(ref).strip()):      # a ref from a read result points at exactly one entity
+            eid = int(str(ref).strip()[2:])
+            if not self.con.execute("SELECT 1 FROM entities WHERE id=?", (eid,)).fetchone():
+                raise ValueError(f"no entity {ref}")
+            return eid
         if isinstance(ref, dict):
             kind, name = ref.get("kind"), ref.get("name")
             props, aliases = ref.get("props"), list(ref.get("aliases") or [])
@@ -453,11 +470,92 @@ class Store:
                 out.append({"ref": f"v:{eid}", "when": iso(ts), "title": title, "kind": k, "with": names, **({"body": body[:300]} if body else {})})
             return out
 
+    # ------------------------------------------------------------------ meaning search (vectors live in the encrypted db)
+    def embed_pending(self, embedder, batch: int = 32) -> int:
+        """Embed things whose text changed. The model runs outside the db lock so reads and writes are never held up by it."""
+        with self.lock:
+            refs = [r[0] for r in self.con.execute("SELECT ref FROM vec_dirty LIMIT ?", (batch,))]
+            rows = {}
+            for ref in refs:
+                r = self.con.execute("SELECT kind,name,body FROM fts WHERE ref=?", (ref,)).fetchone()
+                if r:
+                    rows[ref] = f"{r[0]}: {r[1]}. {r[2] or ''}"[:2000]
+        if not refs:
+            return 0
+        vecs = embedder.embed(list(rows.values())) if rows else []
+        with self.lock:
+            for ref, v in zip(rows, vecs):
+                self.con.execute("INSERT OR REPLACE INTO vectors(ref,model,dim,vec) VALUES(?,?,?,?)", (ref, embedder.name, len(v), v.astype("float32").tobytes()))
+            for ref in refs:
+                self.con.execute("DELETE FROM vec_dirty WHERE ref=?", (ref,))
+            self._vmat = None
+            self.con.commit()
+        return len(refs)
+
+    def reindex(self, model: str | None = None) -> int:
+        """Mark everything for re-embedding (after changing the backend); stale vectors from another model are dropped."""
+        with self.lock:
+            if model:
+                self.con.execute("DELETE FROM vectors WHERE model<>?", (model,))
+            self.con.execute("INSERT OR IGNORE INTO vec_dirty(ref) SELECT ref FROM fts WHERE ref NOT IN (SELECT ref FROM vectors)")
+            self._vmat = None
+            self.con.commit()
+            return self.con.execute("SELECT count(*) FROM vec_dirty").fetchone()[0]
+
+    def index_status(self) -> dict:
+        with self.lock:
+            q = lambda t: self.con.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+            return {"indexed": q("vectors"), "waiting": q("vec_dirty"), "models": [r[0] for r in self.con.execute("SELECT DISTINCT model FROM vectors")]}
+
+    def semantic(self, embedder, query: str, limit: int = 10, min_score: float = 0.0) -> list[tuple[str, float]]:
+        qv = embedder.embed([query])[0]
+        with self.lock:
+            if self._vmat is None:
+                rows = self.con.execute("SELECT ref,vec FROM vectors WHERE model=?", (embedder.name,)).fetchall()
+                self._vmat = ([r[0] for r in rows], np.array([np.frombuffer(r[1], dtype=np.float32) for r in rows]) if rows else np.zeros((0, 1), dtype=np.float32))
+            refs, mat = self._vmat
+        if not refs or mat.shape[1] != len(qv):
+            return []
+        sims = mat @ qv
+        top = np.argsort(-sims)[:limit]
+        return [(refs[i], float(sims[i])) for i in top if sims[i] > min_score]
+
+    def hybrid_search(self, embedder, q: str, limit: int = 10) -> list[dict]:
+        """Keyword hits and meaning hits merged by reciprocal rank, so an exact name still wins and a paraphrase still finds it."""
+        kw = self.search(q, limit * 3)
+        try:
+            sem = self.semantic(embedder, q, limit * 3, 0.15)
+        except Exception:   # noqa: BLE001  (model not ready: keyword search still works)
+            sem = []
+        score: dict[str, float] = {}
+        via: dict[str, set] = {}
+        for rank, h in enumerate(kw):
+            score[h["ref"]] = score.get(h["ref"], 0) + 1 / (60 + rank)
+            via.setdefault(h["ref"], set()).add("keyword")
+        for rank, (ref, _) in enumerate(sem):
+            score[ref] = score.get(ref, 0) + 1 / (60 + rank)
+            via.setdefault(ref, set()).add("meaning")
+        by_ref = {h["ref"]: h for h in kw}
+        out = []
+        with self.lock:
+            for ref in sorted(score, key=score.get, reverse=True)[:limit]:
+                h = by_ref.get(ref)
+                if not h:
+                    r = self.con.execute("SELECT kind,name,body FROM fts WHERE ref=?", (ref,)).fetchone()
+                    if not r:
+                        continue
+                    h = {"ref": ref, "kind": r[0], "name": r[1], "snippet": (r[2] or "")[:100]}
+                    if ref.startswith("v:"):
+                        ev = self.con.execute("SELECT ts FROM events WHERE id=?", (int(ref[2:]),)).fetchone()
+                        h["when"] = iso(ev[0]) if ev else None
+                out.append({**h, "found_by": "both" if len(via[ref]) == 2 else next(iter(via[ref]))})
+        return out
+
     def graph_view(self, limit: int = 400) -> dict:
         """Names, kinds and connections only (no fact or event text): enough to draw the graph. Links are explicit edges plus
         entities that share events."""
         with self.lock:
-            ents = self.con.execute("SELECT id,kind,name,updated_at FROM entities ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+            ents = self.con.execute("SELECT id,kind,name,updated_at FROM entities WHERE kind<>'file' ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()   # files would drown the picture; they stay searchable
             ids = {r[0] for r in ents}
             ev = dict(self.con.execute("SELECT entity_id,count(*) FROM event_entities GROUP BY entity_id").fetchall())
             fc = dict(self.con.execute("SELECT entity_id,count(*) FROM facts WHERE superseded_by IS NULL GROUP BY entity_id").fetchall())
@@ -536,7 +634,7 @@ class Store:
                 for k, v in fp.items():
                     tp.setdefault(k, v)
                 q("UPDATE entities SET props=?, created_at=?, updated_at=? WHERE id=?", json.dumps(tp), min(f[4] or time.time(), t[4] or time.time()), time.time(), dst)
-                q("DELETE FROM fts WHERE ref=?", f"e:{src}")
+                self._drop_search(f"e:{src}")
                 q("DELETE FROM entities WHERE id=?", src)
                 self._refresh_entity_fts(dst)
                 if dry_run:
@@ -550,6 +648,12 @@ class Store:
                 if not self._tx:
                     self.con.rollback()
                 raise
+
+    def names(self, limit: int = 80) -> list[str]:
+        """Entity names (kind:name), most recently active first, for tools that want to reuse the owner's spellings."""
+        with self.lock:
+            return [f"{k}:{n}" for k, n in self.con.execute(
+                "SELECT kind,name FROM entities WHERE kind<>'bucket' AND NOT (kind='person' AND norm='me') ORDER BY updated_at DESC LIMIT ?", (limit,))]
 
     def stats(self) -> dict:
         with self.lock:
@@ -620,54 +724,65 @@ class Store:
         k, i = snap["kind"], snap["id"]
         tbl = {"e": "entities", "v": "events", "f": "facts", "g": "edges"}[k]
         self.con.execute(f"DELETE FROM {tbl} WHERE id=?", (i,))
-        self.con.execute("DELETE FROM fts WHERE ref=?", (f"{k}:{i}",))
+        self._drop_search(f"{k}:{i}")
         if k == "f":      # a deleted fact must stop being findable through its entity's search text
             self._refresh_entity_fts(snap["row"][0])
 
-    def restore_snapshot(self, sn: dict) -> int:
-        """Put a snapshot back under its old ref. Links to things that have since gone are skipped; returns how many."""
+    def restore_snapshot(self, sn: dict) -> tuple[int, str | None]:
+        """Put a snapshot back under its old ref. Links to things that have since gone are skipped. If the old id has since been
+        taken (stores made before ids were never reused), it comes back under a new id. Returns (links skipped, 'old→new' or None)."""
         k, i, row = sn["kind"], sn["id"], sn["row"]
+        tbl = {"e": "entities", "v": "events", "f": "facts", "g": "edges"}[k]
         ex = lambda eid: self.con.execute("SELECT 1 FROM entities WHERE id=?", (eid,)).fetchone() is not None
+        moved = None
+        if self.con.execute(f"SELECT 1 FROM {tbl} WHERE id=?", (i,)).fetchone():
+            moved, newid = True, None
+        else:
+            newid = i
         skipped = 0
         if k == "e":
-            self.con.execute("INSERT INTO entities(id,kind,name,norm,props,created_at,updated_at,source) VALUES(?,?,?,?,?,?,?,?)", (i, *row))
+            cur = self.con.execute("INSERT INTO entities(id,kind,name,norm,props,created_at,updated_at,source) VALUES(?,?,?,?,?,?,?,?)", (newid, *row))
+            eid = cur.lastrowid
             for a in sn["aliases"]:
-                self.con.execute("INSERT OR IGNORE INTO aliases(entity_id,alias,norm) VALUES(?,?,?)", (i, a, norm(a)))
+                self.con.execute("INSERT OR IGNORE INTO aliases(entity_id,alias,norm) VALUES(?,?,?)", (eid, a, norm(a)))
             for kk, nn in sn["merged_names"]:
-                self.con.execute("INSERT OR IGNORE INTO merged_names(kind,norm,entity_id) VALUES(?,?,?)", (kk, nn, i))
+                self.con.execute("INSERT OR IGNORE INTO merged_names(kind,norm,entity_id) VALUES(?,?,?)", (kk, nn, eid))
             for f in sn["facts"]:
-                self.con.execute("INSERT INTO facts(id,entity_id,text,ts,source,superseded_by) VALUES(?,?,?,?,?,?)", (f[0], i, *f[1:]))
+                fid = None if self.con.execute("SELECT 1 FROM facts WHERE id=?", (f[0],)).fetchone() else f[0]
+                self.con.execute("INSERT INTO facts(id,entity_id,text,ts,source,superseded_by) VALUES(?,?,?,?,?,?)", (fid, eid, *f[1:]))
             for g in sn["edges"]:
-                if ex(g[1]) and ex(g[3]):
-                    self.con.execute("INSERT OR IGNORE INTO edges(id,src,rel,dst,props,start_ts,end_ts,created_at,source) VALUES(?,?,?,?,?,?,?,?,?)", g)
+                src, dst = (eid if g[1] == i else g[1]), (eid if g[3] == i else g[3])
+                if ex(src) and ex(dst):
+                    gid = None if self.con.execute("SELECT 1 FROM edges WHERE id=?", (g[0],)).fetchone() else g[0]
+                    self.con.execute("INSERT INTO edges(id,src,rel,dst,props,start_ts,end_ts,created_at,source) VALUES(?,?,?,?,?,?,?,?,?)", (gid, src, g[2], dst, *g[4:]))
                 else:
                     skipped += 1
             for v, role in sn["event_links"]:
                 if self.con.execute("SELECT 1 FROM events WHERE id=?", (v,)).fetchone():
-                    self.con.execute("INSERT OR IGNORE INTO event_entities(event_id,entity_id,role) VALUES(?,?,?)", (v, i, role))
+                    self.con.execute("INSERT OR IGNORE INTO event_entities(event_id,entity_id,role) VALUES(?,?,?)", (v, eid, role))
                 else:
                     skipped += 1
-            self._refresh_entity_fts(i)
+            self._refresh_entity_fts(eid)
         elif k == "f":
             if not ex(row[0]):
                 raise ValueError("the entity this fact belonged to is gone")
-            self.con.execute("INSERT INTO facts(id,entity_id,text,ts,source,superseded_by) VALUES(?,?,?,?,?,?)", (i, *row))
+            eid = self.con.execute("INSERT INTO facts(id,entity_id,text,ts,source,superseded_by) VALUES(?,?,?,?,?,?)", (newid, *row)).lastrowid
             self._refresh_entity_fts(row[0])
         elif k == "g":
             if not (ex(row[0]) and ex(row[2])):
                 raise ValueError("one end of this link is gone")
-            self.con.execute("INSERT INTO edges(id,src,rel,dst,props,start_ts,end_ts,created_at,source) VALUES(?,?,?,?,?,?,?,?,?)", (i, *row))
+            eid = self.con.execute("INSERT INTO edges(id,src,rel,dst,props,start_ts,end_ts,created_at,source) VALUES(?,?,?,?,?,?,?,?,?)", (newid, *row)).lastrowid
         else:
-            self.con.execute("INSERT INTO events(id,ts,title,body,kind,props,created_at,source,dedupe) VALUES(?,?,?,?,?,?,?,?,?)", (i, *row))
+            eid = self.con.execute("INSERT INTO events(id,ts,title,body,kind,props,created_at,source,dedupe) VALUES(?,?,?,?,?,?,?,?,?)", (newid, *row)).lastrowid
             names = []
-            for eid, role in sn["links"]:
-                if ex(eid):
-                    self.con.execute("INSERT OR IGNORE INTO event_entities(event_id,entity_id,role) VALUES(?,?,?)", (i, eid, role))
-                    names.append(self._name(eid)["name"])
+            for e2, role in sn["links"]:
+                if ex(e2):
+                    self.con.execute("INSERT OR IGNORE INTO event_entities(event_id,entity_id,role) VALUES(?,?,?)", (eid, e2, role))
+                    names.append(self._name(e2)["name"])
                 else:
                     skipped += 1
-            self._fts_set(f"v:{i}", row[3], row[1], f"{row[2] or ''} {' '.join(names)}")
-        return skipped
+            self._fts_set(f"v:{eid}", row[3], row[1], f"{row[2] or ''} {' '.join(names)}")
+        return skipped, (f"{k}:{i}→{k}:{eid}" if moved else None)
 
     def forget(self, ref: str, source: str = "") -> bool:
         """Hard delete with no undo: the owner's CLI path. The audit log keeps that it happened, not what it was."""

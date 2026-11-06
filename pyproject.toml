@@ -7,7 +7,11 @@ name = "lifegraph"
 version = "0.1.0"
 description = "A private, encrypted graph of your life that your chats can write to"
 requires-python = ">=3.11"
-dependencies = ["sqlcipher3-binary", "pynacl", "mcp", "keyring"]
+dependencies = ["sqlcipher3-binary", "pynacl", "mcp", "keyring", "numpy"]
+
+[project.optional-dependencies]
+semantic = ["fastembed"]
+dev = ["pytest"]
 
 [project.scripts]
 life = "lifegraph.cli:main"

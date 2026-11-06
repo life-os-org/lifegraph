@@ -12,7 +12,8 @@ BIN = os.path.join(os.path.dirname(sys.executable))
 def sandbox(tmp_path):
     env = dict(os.environ, LIFEGRAPH_HOME=str(tmp_path / "home"), LIFEGRAPH_RUNTIME=str(tmp_path / "run"), LIFEGRAPH_PASSPHRASE=PW,
                LIFEGRAPH_SOURCE="test-chat", PYTHON_KEYRING_BACKEND="fakering.FileKeyring", FAKERING_FILE=str(tmp_path / "keyring.json"),
-               PYTHONPATH=os.pathsep.join(filter(None, [os.path.dirname(__file__), os.environ.get("PYTHONPATH", "")])))
+               HOME=str(tmp_path / "h"), LIFEGRAPH_EMBED="lite", PYTHONPATH=os.pathsep.join(filter(None, [os.path.dirname(__file__), os.environ.get("PYTHONPATH", "")])))
+    (tmp_path / "h").mkdir()
     daemon = subprocess.Popen([os.path.join(BIN, "lifegraphd")], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for _ in range(50):
         if (tmp_path / "run" / "lifegraph" / "sock").exists(): break
@@ -186,7 +187,7 @@ def test_review_page_shows_pending_changes_and_decides(sandbox):
     p = subprocess.Popen([os.path.join(BIN, "life"), "review", "--no-open"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         url = re.search(r"http://\S+/", p.stdout.readline()).group(0)
-        page = urllib.request.urlopen(url).read().decode(); assert "Review changes" in page
+        page = urllib.request.urlopen(url).read().decode(); assert "Life graph" in page and "Explore" in page
         ch = json.loads(urllib.request.urlopen(url + "api/changes").read())
         assert [c["changeset"] for c in ch["pending"]] == [held["changeset"]] and any(n["name"] == "Met Alex" and n["state"] == "new" for n in ch["pending"][0]["graph"]["nodes"])
         with pytest.raises(urllib.error.HTTPError): urllib.request.urlopen(url.rsplit("/", 2)[0] + "/wrong/api/changes")          # no guessing the address
@@ -197,3 +198,130 @@ def test_review_page_shows_pending_changes_and_decides(sandbox):
         with pytest.raises(urllib.error.HTTPError): urllib.request.urlopen(req)                                                    # browsers' cross-site posts can't use it
     finally:
         p.terminate(); p.wait(5)
+
+
+FAKE_LLM = """#!/usr/bin/env python3
+import sys, json
+prompt = sys.stdin.read()
+open(sys.argv[1], "w").write(prompt)
+print("Sure! " + json.dumps({"ops": [
+  {"op": "event", "title": "Decided to ship the review page", "when": "2026-11-05", "people": ["Sam"], "projects": ["Lifegraph"], "kind": "decision", "paths": ["/work/lifegraph/src/a.py", "/etc/passwd"]},
+  {"op": "fact", "subject": "project:Lifegraph", "text": "uses a local daemon"},
+  {"op": "forget", "ref": "e:1"}]}))
+"""
+
+def write_transcript(path, secret="sk-abcdefghijklmnop1234567890"):
+    rows = []
+    for i in range(5):
+        rows.append({"type": "user", "timestamp": "2026-11-05T10:00:00Z", "cwd": "/work/lifegraph", "message": {"role": "user", "content": f"message {i} about Lifegraph with Sam. my key is {secret}" if i == 0 else f"message {i}"}})
+        rows.append({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": f"reply {i}"}, {"type": "tool_use", "name": "Bash", "input": {"command": "TOOL-NOISE"}},
+                                                                                  {"type": "tool_use", "name": "Edit", "input": {"file_path": "/work/lifegraph/src/a.py"}},
+                                                                                  {"type": "tool_use", "name": "Read", "input": {"file_path": "/work/lifegraph/README.md"}},
+                                                                                  {"type": "tool_use", "name": "Write", "input": {"file_path": "/tmp/scratch.log"}}]}})
+    rows.append({"type": "user", "isMeta": True, "message": {"role": "user", "content": "META-NOISE"}})
+    path.write_text("\n".join(json.dumps(r) for r in rows))
+
+def wait_for(fn, secs=8):
+    t = time.time()
+    while time.time() - t < secs:
+        v = fn()
+        if v: return v
+        time.sleep(0.2)
+    return fn()
+
+def test_capture_on_off_proposes_only_and_scrubs(sandbox, tmp_path):
+    env = sandbox; life(env, "init"); home = tmp_path / "h"
+    settings = home / ".claude" / "settings.json"; settings.parent.mkdir()
+    settings.write_text(json.dumps({"model": "x", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "mine"}]}], "SessionEnd": [{"hooks": [{"type": "command", "command": "other-tool"}]}]}}))
+    llm = tmp_path / "llm.py"; llm.write_text(FAKE_LLM); llm.chmod(0o755); seen = tmp_path / "prompt.txt"
+    tr = tmp_path / "t.jsonl"; write_transcript(tr)
+    assert "OFF" not in life(env, "capture", "status").stdout and "off" in life(env, "capture", "status").stdout
+    out = life(env, "capture", "on", "--backend", "command", "--command", f"{llm} {seen}").stdout
+    assert "ON" in out and "sent to" in out                                                              # says where the transcript goes
+    hooks = json.loads(settings.read_text())["hooks"]
+    assert hooks["Stop"][0]["hooks"][0]["command"] == "mine" and len(hooks["SessionEnd"]) == 2          # nothing of the user's was touched
+    assert (home / ".claude" / "settings.json.lifegraph-backup").exists() and "installed" in life(env, "capture", "status").stdout
+
+    # the hook returns at once; the work happens detached. A tiny session is ignored, a real one is proposed, never applied.
+    stdin = json.dumps({"transcript_path": str(tr), "cwd": "/work/lifegraph", "hook_event_name": "SessionEnd"})
+    t0 = time.time(); subprocess.run([os.path.join(BIN, "life"), "capture", "hook"], env=env, input=stdin, text=True, check=True); assert time.time() - t0 < 5
+    pend = wait_for(lambda: "capture" in life(env, "pending").stdout)
+    assert pend, life(env, "capture", "status").stdout
+    p = life(env, "pending").stdout
+    assert "Decided to ship the review page" in p and "uses a local daemon" in p and "forget" not in p.lower().replace("forgot", "")   # destructive ops are dropped
+    assert "Decided" not in life(env, "search", "Decided").stdout                                           # proposed, not applied
+    assert "tied to 2 path(s): /work/lifegraph, /work/lifegraph/src/a.py" in p and "located_at→ directory:/work/lifegraph" in p       # the folder and the touched file, nobody typed them
+    assert "/etc/passwd" not in p and "scratch.log" not in p                                                                       # an invented path and temp noise are dropped
+    prompt = seen.read_text(); assert "/work/lifegraph/src/a.py" in prompt and "/work/lifegraph/README.md" in prompt
+
+    assert "sk-abcdefghijklmnop" not in prompt and "[api key]" in prompt and "TOOL-NOISE" not in prompt and "META-NOISE" not in prompt and "message 3" in prompt
+    assert "capture:claude@lifegraph" in p                                                                   # you can see which session it came from
+    life(env, "approve", "all"); assert "Decided" in life(env, "search", "Decided").stdout
+    proj = life(env, "show", "project:Lifegraph").stdout; assert "located_at" in proj and "directory:/work/lifegraph" in proj          # "where does Lifegraph live?" is now answerable
+
+    # never captures itself, can be skipped per session, and off means off
+    seen.unlink(); before = life(env, "pending").stdout
+    for extra in ({"LIFEGRAPH_CAPTURE_RUN": "1"}, {"LIFEGRAPH_NO_CAPTURE": "1"}):
+        subprocess.run([os.path.join(BIN, "life"), "capture", "hook"], env=dict(env, **extra), input=stdin, text=True, check=True)
+    time.sleep(1.5); assert not seen.exists()
+    short = tmp_path / "short.jsonl"; short.write_text(json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}}))
+    subprocess.run([os.path.join(BIN, "life"), "capture", "hook"], env=env, input=json.dumps({"transcript_path": str(short)}), text=True, check=True); time.sleep(1.5); assert not seen.exists()
+    life(env, "capture", "off")
+    assert json.loads(settings.read_text())["hooks"]["SessionEnd"] == [{"hooks": [{"type": "command", "command": "other-tool"}]}]      # only our entry removed
+    subprocess.run([os.path.join(BIN, "life"), "capture", "hook"], env=env, input=stdin, text=True, check=True); time.sleep(1.5); assert not seen.exists()
+    r = life(env, "capture", "run", "--transcript", str(tr), "--dry-run"); assert "Decided to ship" in r.stdout and seen.exists()
+
+def test_slash_command_is_installed_and_served_as_an_mcp_prompt(sandbox, tmp_path):
+    env = dict(sandbox); life(env, "init"); fake = tmp_path / "bin"; fake.mkdir()
+    for n in ("claude", "codex"):
+        (fake / n).write_text("#!/bin/sh\n"); (fake / n).chmod(0o755)
+    env["PATH"] = f"{fake}:{env['PATH']}"; env["OPENCODE_CONFIG"] = str(tmp_path / "oc.json")
+    life(env, "connect", "all"); h = tmp_path / "h"
+    for f in (h / ".claude/commands/lifegraph.md", h / ".codex/prompts/lifegraph.md", h / ".config/opencode/command/lifegraph.md"):
+        body = f.read_text(); assert "dry_run=true" in body and "Save these?" in body and "$ARGUMENTS" in body
+    async def prompts():
+        params = StdioServerParameters(command=os.path.join(BIN, "lifegraph-mcp"), args=[], env=env)
+        async with stdio_client(params) as (r, w):
+            async with ClientSession(r, w) as s:
+                await s.initialize(); names = [p.name for p in (await s.list_prompts()).prompts]
+                got = await s.get_prompt("lifegraph", {"focus": "the decisions"})
+                return names, got.messages[0].content.text
+    names, txt = asyncio.run(prompts()); assert names == ["lifegraph"] and "Focus on: the decisions" in txt and "search" in txt
+
+
+def test_explorer_search_open_fix_and_undo(sandbox):
+    import urllib.request, urllib.parse, re
+    env = sandbox; life(env, "init"); w = grant(env, "chat-w", "--level", "write")
+    asyncio.run(mcp(env, "propose", {"ops": [{"op": "event", "title": "Debugged the scheduler deadlock", "when": "2026-10-01", "projects": ["Kernel"], "people": ["Sam"]},
+                                             {"op": "fact", "subject": "person:Sam", "text": "prefers vegetarian food"}, {"op": "fact", "subject": "person:Sam", "text": "likes tea"}]}, token=w))
+    p = subprocess.Popen([os.path.join(BIN, "life"), "ui", "--no-open"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        url = re.search(r"http://\S+/", p.stdout.readline()).group(0)
+        get = lambda path: json.loads(urllib.request.urlopen(url + path).read())
+        post = lambda path, body: json.loads(urllib.request.urlopen(urllib.request.Request(url + path, json.dumps(body).encode(), {"Content-Type": "application/json"})).read())
+        g = get("api/graph"); assert {n["name"] for n in g["nodes"]} >= {"Sam", "Kernel"} and g["links"]
+        st = get("api/stats"); assert st["entities"] >= 2 and "search_index" in st                          # what the native window's boot screen reads
+        wait_for(lambda: get("api/search?q=" + urllib.parse.quote("schedulr deadlok")))               # typos: found through the meaning index once it has built
+        hits = wait_for(lambda: get("api/search?q=" + urllib.parse.quote("schedulr deadlok")))
+        assert hits and hits[0]["name"] == "Debugged the scheduler deadlock", hits
+        sam = get("api/get?ref=" + urllib.parse.quote("person:Sam")); tea = next(f for f in sam["facts"] if f["text"] == "likes tea")
+        assert get("api/get?ref=" + urllib.parse.quote(sam["ref"]))["name"] == "Sam"                    # refs open exactly that entity
+        r = post("api/apply", {"ops": [{"op": "forget", "ref": tea["ref"]}]}); assert r["status"] == "applied"
+        assert "likes tea" not in life(env, "show", "Sam").stdout
+        post("api/apply", {"ops": [{"op": "edit_fact", "ref": next(f for f in get("api/get?ref=" + urllib.parse.quote(sam["ref"]))["facts"] if "vegetarian" in f["text"])["ref"], "text": "is vegan"}]})
+        assert "is vegan" in life(env, "show", "Sam").stdout
+        post("api/apply", {"ops": [{"op": "fact", "subject": sam["ref"], "text": "added from the UI"}]}); assert "added from the UI" in life(env, "show", "Sam").stdout   # an e: ref targets that entity, not a new one
+        assert post("api/decide", {"id": r["changeset"], "action": "undo"})["ok"] and "likes tea" in life(env, "show", "Sam").stdout          # the toast's Undo
+        bad = post("api/apply", {"ops": [{"op": "forget", "ref": "f:9999"}]}); assert bad["status"] == "invalid"
+    finally:
+        p.terminate(); p.wait(5)
+
+def test_semantic_status_and_search_by_meaning(sandbox):
+    env = sandbox; life(env, "init"); w = grant(env, "chat-w", "--level", "write")
+    asyncio.run(mcp(env, "propose", {"ops": [{"op": "event", "title": "Debugged the scheduler deadlock", "when": "2026-10-01", "projects": ["Kernel"]}]}, token=w))
+    st = wait_for(lambda: "waiting: 0" in life(env, "semantic", "status").stdout and life(env, "semantic", "status").stdout)
+    assert st and "lite" in st and "indexed: 0" not in st
+    _, hits = asyncio.run(mcp(env, "search", {"query": "schedulr deadlok"}, token=w)); hits = hits.get("result", hits)
+    assert hits and hits[0]["name"] == "Debugged the scheduler deadlock" and hits[0]["found_by"] == "meaning"           # agents get this automatically
+    assert "queued" in life(env, "semantic", "backend", "lite").stdout or "set to" in life(env, "semantic", "backend", "lite").stdout
+    assert "Re-indexing" in life(env, "semantic", "reindex").stdout
